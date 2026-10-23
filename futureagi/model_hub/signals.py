@@ -8,6 +8,8 @@ Also handles cascade soft-delete when Dataset, PromptTemplate, or
 PromptVersion are soft-deleted.
 """
 
+import threading
+import time
 from threading import local
 
 import structlog
@@ -18,6 +20,11 @@ logger = structlog.get_logger(__name__)
 
 # Thread-local storage for capturing old state before save
 _thread_locals = local()
+
+# --- Rate limiter for Dataset eval hook ---
+# Max 1 evaluation trigger per second across all Dataset creations.
+_eval_rate_lock = threading.Lock()
+_eval_last_run: float = 0.0
 
 
 @receiver(pre_save, sender="model_hub.PromptVersion")
@@ -289,3 +296,144 @@ def cascade_soft_delete_on_prompt_version_deletion(sender, instance, **kwargs):
                 prompt_version_id=str(instance.id),
                 nodes_deleted=nodes_cascaded,
             )
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Evaluation hook — auto-run evaluations when datasets are created
+# ──────────────────────────────────────────────────────────────────────
+
+_DATASET_EVAL_HOOK_ENABLED = True  # Toggle for operational control
+
+
+def _evaluation_rate_limited() -> bool:
+    """Return True if the rate limit is exceeded, False if allowed."""
+    global _eval_last_run
+    with _eval_rate_lock:
+        now = time.time()
+        if now - _eval_last_run < 1.0:
+            return True  # Rate-limited
+        _eval_last_run = now
+        return False
+
+
+def _trigger_dataset_evals(dataset) -> None:
+    """
+    Schedule evaluations for a newly created dataset.
+
+    Looks up UserEvalMetric records associated with the dataset and
+    fires off evaluation runs asynchronously.  Falls back to dataset-level
+    eval_reasons if no UserEvalMetric records are found.
+
+    This function is intentionally fire-and-forget — failures are logged
+    but never propagated back to the Dataset save path.
+    """
+    from model_hub.models.evals_metric import UserEvalMetric
+
+    try:
+        user_eval_metrics = list(
+            UserEvalMetric.objects.filter(
+                dataset=dataset, deleted=False
+            ).select_related("template", "organization")
+        )
+    except Exception:
+        logger.exception(
+            "eval_hook_failed_to_query_metrics",
+            dataset_id=str(dataset.id),
+        )
+        return
+
+    if not user_eval_metrics:
+        logger.debug(
+            "eval_hook_no_metrics_found",
+            dataset_id=str(dataset.id),
+            reason="No UserEvalMetric rows linked to this dataset yet.",
+        )
+        return
+
+    triggered = 0
+    for uem in user_eval_metrics:
+        try:
+            _run_single_eval_metric(uem, dataset)
+            triggered += 1
+        except Exception:
+            logger.exception(
+                "eval_hook_single_failed",
+                dataset_id=str(dataset.id),
+                metric_id=str(uem.id),
+            )
+
+    if triggered:
+        logger.info(
+            "eval_hook_triggered",
+            dataset_id=str(dataset.id),
+            dataset_name=dataset.name,
+            metrics_triggered=triggered,
+        )
+
+
+def _run_single_eval_metric(user_eval_metric, dataset) -> None:
+    """Fire a single evaluation for one UserEvalMetric on a dataset.
+
+    Delegates to the shared ``run_eval_func`` for consistency with
+    the rest of the evaluation pipeline (playground, experiment runner,
+    composite runner, etc.).
+    """
+    from model_hub.views.utils.evals import run_eval_func
+
+    template = user_eval_metric.template
+    org = user_eval_metric.organization
+    config = user_eval_metric.config or {}
+
+    # Build mappings from the metric config — the dataset-level context
+    # (columns, rows) is resolved by the runner when it encounters
+    # `{{column.<id>}}` / `{{row.<id>}}` templates.
+    mappings = config.get("mapping", {}).copy()
+
+    run_eval_func(
+        config=config,
+        mappings=mappings,
+        template=template,
+        org=org,
+        model=config.get("model") or "turing_large",
+        workspace=getattr(dataset, "workspace", None),
+        input_data_types=config.get("input_data_types", {}),
+        kb_id=config.get("kb_id", None),
+        error_localizer=config.get("error_localizer", False),
+    )
+
+
+@receiver(post_save, sender="model_hub.Dataset")
+def dataset_eval_hook(sender, instance, created, **kwargs):
+    """
+    Post-save signal handler that triggers evaluations when new Datasets
+    are created.
+
+    Safety guarantees:
+    1. Only fires on creation (``created=True``) — not on updates.
+    2. Rate-limited to 1 trigger / second across all Dataset creations.
+    3. Exceptions are caught and logged; Dataset saves are never blocked.
+    4. A global toggle (``_DATASET_EVAL_HOOK_ENABLED``) allows disabling
+       the hook without a code deploy.
+    """
+    if not created:
+        return
+
+    if not _DATASET_EVAL_HOOK_ENABLED:
+        return
+
+    if _evaluation_rate_limited():
+        logger.info(
+            "eval_hook_rate_limited",
+            dataset_id=str(instance.id),
+            dataset_name=instance.name,
+        )
+        return
+
+    try:
+        _trigger_dataset_evals(instance)
+    except Exception:
+        logger.exception(
+            "eval_hook_unexpected_failure",
+            dataset_id=str(instance.id),
+            dataset_name=instance.name,
+        )
